@@ -1,0 +1,117 @@
+import asyncio
+import json
+import os
+import shutil
+from dataclasses import dataclass
+from urllib.parse import urlparse, urljoin
+import pandas as pd
+from crowd_sdk.tagme import TagmeClientAdvanced
+from crowd_sdk.tagme.http_client.datacls import FileMetaData, TaskFile
+from tqdm import tqdm
+
+
+@dataclass
+class File:
+    filename: str
+    file_id: str
+    premarkup: dict
+    file_path: str
+
+
+def construct_config(config: dict) -> dict:
+    if config['netloc'] == 'tagme.apps.prom-gen.sigma.sbrf.ru':
+        config['config_path'] = os.path.expanduser('~/configs/.sigma.cfg')
+        config['task_params'] = ['K3', '-']
+    elif config['netloc'] == 'tagme.sberdevices.ru':
+        config['config_path'] = os.path.expanduser('~/configs/.cloud.cfg')
+    return config
+
+
+def parse_url(tg_url: str) -> dict:
+    parsed_url = urlparse(tg_url)
+    config = parsed_url.path.split('/')
+    try:
+        return {
+            'netloc': parsed_url.netloc,
+            'org_id': config[2],
+            'project_id': config[4],
+            'task_id': config[6]
+        }
+    except IndexError:
+        raise ValueError('Вы ввели некорректный URL.')
+
+
+async def get_files_and_meta(task_url: str, dir_out: str) -> list[File]:
+    parsed_url = parse_url(task_url)
+
+    config = construct_config({'netloc': parsed_url['netloc']})
+    client = TagmeClientAdvanced(config['config_path'])
+
+    organization_id = parsed_url.get('org_id')
+    task_id = parsed_url.get('task_id')
+
+    if os.path.exists(dir_out):
+        shutil.rmtree(dir_out)
+    os.mkdir(dir_out)
+
+    await client.download_task_data(task_id, dir_out, organization_id)
+
+    meta_data = await client.get_task_files_meta(task_id=task_id, organization_id=organization_id)
+    task_files = await client.get_task_files(task_id=task_id, organization_id=organization_id)
+
+    files = []
+    for task_file in task_files:
+        for meta in meta_data:
+            if task_file.uid == meta.file_id:
+                file = File(
+                    filename=task_file.name,
+                    file_id=task_file.uid,
+                    premarkup=meta.premarkup,
+                    file_path=os.path.join(dir_out, task_file.name)
+                )
+                files.append(file)
+                break
+
+    await client.close()
+    return files
+
+
+async def upload_files_w_meta(files: list[File], dir_out: str) -> None:
+    task_url_to_upload = input("Введите ссылку на задачу для загрузки: ")
+    parsed_url = parse_url(task_url_to_upload)
+
+    config = construct_config({'netloc': parsed_url['netloc']})
+    client = TagmeClientAdvanced(config['config_path'])
+
+    organization_id = parsed_url.get('org_id')
+    task_id = parsed_url.get('task_id')
+
+    task = await client.get_task(task_id=task_id, organization_id=organization_id)
+
+    await client.upload_folder(task=task,
+                               folder=dir_out,
+                               organization_id=organization_id)
+
+    for file in tqdm(files):
+        meta_data = [{
+            'filename': file.filename,
+            'data': {
+                "premarkup": file.premarkup
+            }
+        }]
+        await client.update_meta_data(task_id=task_id,
+                                      data=meta_data,
+                                      organization_id=organization_id)
+
+    await client.close()
+
+
+async def main():
+    task_url = input("Введите ссылку на задачу для выгрузки: ")
+    dir_out = os.path.join(os.getcwd(), 'out')
+    files = await get_files_and_meta(task_url, dir_out)
+    await upload_files_w_meta(files, dir_out)
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
